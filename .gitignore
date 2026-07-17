@@ -1,0 +1,17 @@
+# build
+source/build/
+*.o
+*.pyc
+__pycache__/
+
+# local firmware (do not publish)
+*.img
+boot.img
+xbl_config.img
+vmlinux*
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
