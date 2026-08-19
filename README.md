@@ -88,10 +88,10 @@ adb shell '/data/local/tmp/su -c id'
 
 ## Physical-device validation
 
-Tested successfully on **OPPO Find X9 Ultra**:
+Tested successfully on the Chinese **OPPO Find X9 Ultra** (`PMA110`):
 
-- EU: `PMA110`, firmware `16.0.9.403`
-- CN: `PMA110`, firmware `16.0.7.211`
+- CN firmware `16.0.9.403`
+- CN firmware `16.0.7.211`
 - Kernel on both confirmed builds:
   `6.12.58-android16-6-g7704a1ae279b-ab15213644-4k`
 
