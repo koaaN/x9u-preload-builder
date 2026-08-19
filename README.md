@@ -72,6 +72,20 @@ make -C source clean preload \
 
 The manual Make output is `source/build/bin/preload.so`.
 
+## Run
+
+### ADB LD_PRELOAD
+
+Place the built or downloaded file at `bin/preload.so`, connect the target
+device with USB debugging enabled, then run:
+
+```sh
+adb push bin/preload.so /data/local/tmp/preload.so
+adb shell 'chmod 0644 /data/local/tmp/preload.so'
+adb shell 'LD_PRELOAD=/data/local/tmp/preload.so /system/bin/true'
+adb shell '/data/local/tmp/su -c id'
+```
+
 ## Physical-device validation
 
 Tested successfully on:
