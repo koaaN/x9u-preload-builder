@@ -1,16 +1,17 @@
-# build
+# Generated target and build output
+source/src/target.h
 source/build/
-*.o
+out/
+
+# Firmware inputs must never be committed
+*.img
+*.bin
+vmlinux*
+kallsyms*
+
+# Python/editor files
 *.pyc
 __pycache__/
-
-# local firmware (do not publish)
-*.img
-boot.img
-xbl_config.img
-vmlinux*
-
-# editor / OS
 .DS_Store
 Thumbs.db
 .vscode/

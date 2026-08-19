@@ -1,12 +1,12 @@
 #pragma once
 
-#define _GNU_SOURCE  
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>  
-#include <err.h>  
-#include <stdio.h>  
-#include <sys/mman.h>  
+#include <unistd.h>
+#include <err.h>
+#include <stdio.h>
+#include <sys/mman.h>
 #include <sched.h>
 #include <time.h>
 #include <string.h>

@@ -1112,6 +1112,19 @@ def validate_btf_consumer_layout(btf: BTFInfo) -> None:
     require_size("rt_mutex_waiter", "wake_state", 4)
     require_size("rt_waiter_node", "prio", 4)
     require_size("rt_waiter_node", "deadline", 8)
+    require_size("thread_info", "flags", 8)
+    require_size("task_struct", "atomic_flags", 8)
+    require_size("seccomp", "mode", 4)
+    require_size("seccomp", "filter_count", 4)
+    require_size("seccomp", "filter", 8)
+    mode = btf.field("seccomp", "mode")
+    count = btf.field("seccomp", "filter_count")
+    filter_ptr = btf.field("seccomp", "filter")
+    if count != mode + 4 or filter_ptr != mode + 8:
+        fail(
+            "seccomp mode/filter_count/filter 不满足消费端连续 64 位写布局: "
+            f"mode=0x{mode:x}, count=0x{count:x}, filter=0x{filter_ptr:x}"
+        )
 
 
 PSELECT_ROUTE_NFDS = 320
@@ -1502,7 +1515,13 @@ def has_direct_call(text: str, target: int) -> bool:
     return bool(re.search(rf"\bbl\s+0x{target:x}\b", text, re.I))
 
 
-def validate_frame_live_at(text: str, anchor: str, name: str) -> None:
+def validate_frame_live_at(
+    text: str,
+    anchor: str,
+    name: str,
+    *,
+    allow_prior_epilogues: bool = False,
+) -> None:
     """Prove the first explicit frame allocation is still live at one anchor."""
     lines = text.splitlines()
     anchors = [index for index, line in enumerate(lines) if re.search(anchor, line, re.I)]
@@ -1515,10 +1534,28 @@ def validate_frame_live_at(text: str, anchor: str, name: str) -> None:
     ]
     if len(subs) != 1:
         fail(f"{name} 在 anchor 前的显式 SP frame 数不是 1")
-    for line in lines[subs[0] + 1:anchor_index]:
-        if re.search(r"\b(?:add|sub)\s+sp,\s*sp,", line, re.I):
+    frame_match = re.search(
+        r"\bsub\s+sp,\s*sp,\s*#0x([0-9a-f]+)", lines[subs[0]], re.I
+    )
+    assert frame_match is not None
+    frame_size = int(frame_match.group(1), 16)
+    for index, line in enumerate(lines[subs[0] + 1:anchor_index], subs[0] + 1):
+        stack_adjust = re.search(r"\b(?:add|sub)\s+sp,\s*sp,", line, re.I)
+        post_index_restore = re.search(r"\[[ ]*sp\],\s*#0x[0-9a-f]+", line, re.I)
+        if not stack_adjust and not post_index_restore:
+            continue
+        if allow_prior_epilogues:
+            restores_frame = bool(re.search(
+                rf"\badd\s+sp,\s*sp,\s*#0x{frame_size:x}\b", line, re.I
+            ))
+            nearby = "\n".join(lines[index:index + 8])
+            if restores_frame and re.search(r"\bret\b", nearby, re.I):
+                # LLVM may place cold jump-table cases after a shared return
+                # block. Such cases enter by branch and retain the entry frame.
+                continue
+        if stack_adjust:
             fail(f"{name} 在 anchor 前再次调整 SP")
-        if re.search(r"\[[ ]*sp\],\s*#0x[0-9a-f]+", line, re.I):
+        if post_index_restore:
             fail(f"{name} 在 anchor 前出现 SP post-index 恢复")
 
 
@@ -1542,25 +1579,45 @@ def derive_pselect_layout(
     }
     if not has_direct_call(dis["pselect_wrapper"], kallsyms.one(names["pselect_core"])):
         fail("__arm64_sys_pselect6 未直接调用 core_sys_select")
-    if not has_direct_call(dis["futex_wrapper"], kallsyms.one(names["futex_dispatch"])):
-        fail("__arm64_sys_futex 未直接调用 do_futex")
-    if not has_direct_call(dis["futex_dispatch"], kallsyms.one(names["futex_wait"])):
-        fail("do_futex 未直接调用 futex_wait_requeue_pi")
+    wrapper_calls_dispatch = has_direct_call(
+        dis["futex_wrapper"], kallsyms.one(names["futex_dispatch"])
+    )
+    wrapper_calls_wait = has_direct_call(
+        dis["futex_wrapper"], kallsyms.one(names["futex_wait"])
+    )
+    dispatch_calls_wait = has_direct_call(
+        dis["futex_dispatch"], kallsyms.one(names["futex_wait"])
+    )
+    if wrapper_calls_dispatch and dispatch_calls_wait:
+        futex_call_chain = ("futex_wrapper", "futex_dispatch", "futex_wait")
+    elif wrapper_calls_wait:
+        # Newer Android kernels may inline do_futex into the syscall wrapper.
+        # In that case the waiter is one frame closer to the syscall entry.
+        futex_call_chain = ("futex_wrapper", "futex_wait")
+    else:
+        fail(
+            "__arm64_sys_futex 到 futex_wait_requeue_pi 的直接调用链不受支持"
+        )
     validate_frame_live_at(
         dis["pselect_wrapper"],
         rf"\bbl\s+0x{kallsyms.one(names['pselect_core']):x}\b",
         names["pselect_wrapper"],
     )
+    futex_wrapper_target = (
+        names["futex_dispatch"] if len(futex_call_chain) == 3 else names["futex_wait"]
+    )
     validate_frame_live_at(
         dis["futex_wrapper"],
-        rf"\bbl\s+0x{kallsyms.one(names['futex_dispatch']):x}\b",
+        rf"\bbl\s+0x{kallsyms.one(futex_wrapper_target):x}\b",
         names["futex_wrapper"],
+        allow_prior_epilogues=len(futex_call_chain) == 2,
     )
-    validate_frame_live_at(
-        dis["futex_dispatch"],
-        rf"\bbl\s+0x{kallsyms.one(names['futex_wait']):x}\b",
-        names["futex_dispatch"],
-    )
+    if len(futex_call_chain) == 3:
+        validate_frame_live_at(
+            dis["futex_dispatch"],
+            rf"\bbl\s+0x{kallsyms.one(names['futex_wait']):x}\b",
+            names["futex_dispatch"],
+        )
     frames = {key: first_sp_frame(text, names[key]) for key, text in dis.items()}
     pi_tree = btf.field("rt_mutex_waiter", "pi_tree")
     waiter_candidates: list[tuple[str, int]] = []
@@ -1627,18 +1684,19 @@ def derive_pselect_layout(
     if not any(fds_bytes < threshold <= fds_bytes + 8 for threshold in threshold_matches):
         fail("core_sys_select 未证明 profile nfds 走当前栈 fdset 路线")
     pselect_word0 = -frames["pselect_wrapper"] - frames["pselect_core"] + pselect_buffer
-    futex_waiter = (
-        -frames["futex_wrapper"]
-        - frames["futex_dispatch"]
-        - frames["futex_wait"]
-        + waiter_local
-    )
+    futex_waiter = -sum(frames[name] for name in futex_call_chain) + waiter_local
     delta = futex_waiter - pselect_word0
     if delta < 0 or delta % 8:
         fail(f"pselect/futex 栈重叠差不是非负 qword: {delta}")
     shift = delta // 8
-    if shift > 16:
-        fail(f"PSELECT_WAITER_WORD_SHIFT 异常过大: {shift}")
+    waiter_words = (btf.size("rt_mutex_waiter") + 7) // 8
+    pselect_stack_words = 6 * (fds_bytes // 8)
+    if shift + waiter_words > pselect_stack_words:
+        fail(
+            "rt_mutex_waiter 超出 core_sys_select 的六个栈 fdset: "
+            f"shift={shift}, waiter_words={waiter_words}, "
+            f"stack_words={pselect_stack_words}"
+        )
     result = {
         "PSELECT_WAITER_WORD_SHIFT": shift,
         "WAITER_LOCAL_OFF": waiter_local,
@@ -1647,6 +1705,9 @@ def derive_pselect_layout(
         "pselect_buffer_off": pselect_buffer,
         "pselect_route_nfds": route_nfds,
         "fds_bytes": fds_bytes,
+        "pselect_stack_words": pselect_stack_words,
+        "waiter_words": waiter_words,
+        "futex_call_chain_depth": len(futex_call_chain),
         **{f"frame_{key}": value for key, value in frames.items()},
     }
     return result, dis
@@ -1933,6 +1994,23 @@ def build_header(
         ("TASK_CRED_OFF", "cred"),
     ):
         h.number(macro, btf.field("task_struct", field_name))
+
+    h.section("seccomp / thread flags (from BTF of this boot.img)")
+    h.number(
+        "TASK_THREAD_INFO_FLAGS_OFF",
+        btf.field("task_struct", "thread_info")
+        + btf.field("thread_info", "flags"),
+    )
+    h.number("TASK_ATOMIC_FLAGS_OFF", btf.field("task_struct", "atomic_flags"))
+    h.number("TASK_SECCOMP_OFF", btf.field("task_struct", "seccomp"))
+    h.number("SECCOMP_MODE_OFF", btf.field("seccomp", "mode"))
+    h.number("SECCOMP_FILTER_COUNT_OFF", btf.field("seccomp", "filter_count"))
+    h.number("SECCOMP_FILTER_OFF", btf.field("seccomp", "filter"))
+    # These architecture/kernel flag numbers are stable for the supported arm64
+    # Android branch. They are currently emitted for target completeness; the
+    # minimal post-root path deliberately does not modify either flag word.
+    h.number("TIF_SECCOMP_BIT", 11, decimal=True)
+    h.number("PFA_NO_NEW_PRIVS_BIT", 0, decimal=True)
     return h.render()
 
 

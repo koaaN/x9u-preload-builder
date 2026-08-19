@@ -232,7 +232,7 @@ static void *__mm_leak(void *arg)
                             break;
                         }
                     }
-                } 
+                }
             }
         }
     }

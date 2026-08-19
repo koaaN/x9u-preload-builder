@@ -180,6 +180,13 @@ uintptr_t prepare_good_kernel_page(int payload_mode);
 
 void fdset_put_word(fd_set *set, int word, uint64_t value);
 uint64_t fdset_get_word(const fd_set *set, int word);
+int pselect_stack_uses_result_sets(int shift, int last_waiter_word);
+int open_ready_selected_fds(
+    fd_set *in, fd_set *out, fd_set *ex, int *ready_fd, int *peer_fd);
+int pselect_fdsets_match(
+    const fd_set *expected_in, const fd_set *expected_out,
+    const fd_set *expected_ex, const fd_set *actual_in,
+    const fd_set *actual_out, const fd_set *actual_ex);
 void do_pselect_fake_lock_route(void);
 void reset_main_route_state(void);
 void run_main_route_threads(void);
